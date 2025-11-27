@@ -6,13 +6,10 @@ import plotly.graph_objects as go
 import os
 
 # --- Compatibility Patch for Gradio/HuggingFace Hub ---
-# Fixes ImportError: cannot import name 'HfFolder' from 'huggingface_hub'
-# This happens when using older Gradio versions with newer huggingface_hub versions.
 try:
     import huggingface_hub
 
     if not hasattr(huggingface_hub, "HfFolder"):
-        # Mock the missing class that older Gradio versions expect
         class HfFolder:
             @staticmethod
             def save_token(token): pass
@@ -31,17 +28,22 @@ import gradio as gr
 # ============================================================================
 # 1. CONFIGURATION
 # ============================================================================
-MODEL_PATH = './results/model/airfoil_vae.pth'
+# Model Paths
+VAE_MODEL_PATH = './results/model/airfoil_vae.pth'
+SURROGATE_MODEL_PATH = './results/model/aero_surrogate.pth'
+
+# Data Paths (Reference only, not needed for inference)
+AIRFOIL_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'
+POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/beziergan_gen'
+
 SEQ_LEN = 200
 NUM_CP = 15
-
-# Check device (Force CPU for web app stability usually, but CUDA works if available)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Running on: {DEVICE}")
 
 
 # ============================================================================
-# 2. MODEL DEFINITION (Must match training script exactly)
+# 2. MODEL DEFINITIONS
 # ============================================================================
 class BSplineLayer(nn.Module):
     def __init__(self, num_control_points, degree=3, num_eval_points=100, device='cpu'):
@@ -120,8 +122,6 @@ class AirfoilVAE(nn.Module):
         super().__init__()
         self.device = device
         self.num_cp = num_cp
-
-        # Architecture Constants
         self.dim_t = 3 + 3
         self.dim_c = 2 + 2
         ENC_FILTERS = 64
@@ -139,154 +139,188 @@ class AirfoilVAE(nn.Module):
     def decode_from_latent(self, z_t, z_c):
         cp_t_raw = self.dec_thick(z_t)
         cp_c = self.dec_camber(z_c)
-
         cp_t_pos = F.softplus(cp_t_raw)
         zeros = torch.zeros(cp_t_pos.shape[0], 1, device=self.device)
         cp_t = torch.cat([zeros, cp_t_pos, zeros], dim=1)
-
         t_out = self.bspline(cp_t)
         c_out = self.bspline(cp_c)
         return t_out, c_out
 
+
+class AeroSurrogate(nn.Module):
+    def __init__(self, latent_dim=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + 3, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 3)  # CL, CD, CM
+        )
+
     def forward(self, x):
-        pass
+        return self.net(x)
 
 
 # ============================================================================
 # 3. INITIALIZATION
 # ============================================================================
-def load_model():
-    print("Loading model...")
-    model = AirfoilVAE(seq_len=SEQ_LEN, num_cp=NUM_CP, device=DEVICE).to(DEVICE)
+def load_models():
+    print("Loading VAE model...")
+    vae = AirfoilVAE(seq_len=SEQ_LEN, num_cp=NUM_CP, device=DEVICE).to(DEVICE)
     try:
-        if os.path.exists(MODEL_PATH):
-            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-            print("Model weights loaded.")
-        else:
-            print(f"WARNING: '{MODEL_PATH}' not found. Using random weights.")
+        vae.load_state_dict(torch.load(VAE_MODEL_PATH, map_location=DEVICE))
+        print("VAE weights loaded.")
     except Exception as e:
-        print(f"Error loading model: {e}")
-    model.eval()
-    return model
+        print(f"WARNING: Failed to load VAE: {e}. Using random weights.")
+    vae.eval()
+
+    print("Loading Surrogate model...")
+    surrogate = AeroSurrogate(latent_dim=10).to(DEVICE)
+    try:
+        surrogate.load_state_dict(torch.load(SURROGATE_MODEL_PATH, map_location=DEVICE))
+        print("Surrogate weights loaded.")
+    except Exception as e:
+        print(f"WARNING: Failed to load Surrogate: {e}. Using random weights.")
+    surrogate.eval()
+
+    return vae, surrogate
 
 
-model = load_model()
+vae_model, surrogate_model = load_models()
 
 
 # ============================================================================
 # 4. INTERFACE LOGIC
 # ============================================================================
-def update_geometry(t_max, t_pos, t_le, t_free1, t_free2, t_free3,
-                    c_max, c_pos, c_free1, c_free2):
-    # Construct Latent Vectors
-    # Thickness: [Phys(3) + Free(3)]
-    z_t = torch.tensor([[t_max, t_pos, t_le, t_free1, t_free2, t_free3]],
-                       dtype=torch.float32, device=DEVICE)
+def update_prediction(t_max, t_pos, t_le, t_free1, t_free2, t_free3,
+                      c_max, c_pos, c_free1, c_free2,
+                      mach, reynolds, alpha):
+    # 1. Prepare Latents (Geometry)
+    z_t = torch.tensor([[t_max, t_pos, t_le, t_free1, t_free2, t_free3]], dtype=torch.float32, device=DEVICE)
+    z_c = torch.tensor([[c_max, c_pos, c_free1, c_free2]], dtype=torch.float32, device=DEVICE)
 
-    # Camber: [Phys(2) + Free(2)]
-    z_c = torch.tensor([[c_max, c_pos, c_free1, c_free2]],
-                       dtype=torch.float32, device=DEVICE)
+    # Concatenate for surrogate: [Batch, 10]
+    z_combined = torch.cat([z_t, z_c], dim=1)
 
-    # Decode
+    # 2. Prepare Conditions (Physics)
+    # Normalize Reynolds: Input 1e6 -> Model sees 1.0
+    re_norm = reynolds * 1e-6
+    conds = torch.tensor([[mach, re_norm, alpha]], dtype=torch.float32, device=DEVICE)
+
+    # Combine: [Batch, 13]
+    surrogate_input = torch.cat([z_combined, conds], dim=1)
+
+    # 3. Inference
     with torch.no_grad():
-        t_out, c_out = model.decode_from_latent(z_t, z_c)
+        # Geometry Decoding
+        t_out, c_out = vae_model.decode_from_latent(z_t, z_c)
         t_dist = t_out.cpu().numpy()[0]
         c_dist = c_out.cpu().numpy()[0]
 
-    # Calculate Coordinates
+        # Aerodynamic Prediction
+        preds = surrogate_model(surrogate_input).cpu().numpy()[0]
+        cl, cd, cm = preds[0], preds[1], preds[2]
+
+    # 4. Geometry Plotting
     x_val = 0.5 * (1 - np.cos(np.linspace(0, np.pi, len(t_dist))))
     yu = c_dist + t_dist / 2
     yl = c_dist - t_dist / 2
 
-    # Create Plotly Figure
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_val, y=yu, mode='lines', name='Upper', line=dict(color='royalblue', width=2)))
+    fig.add_trace(go.Scatter(x=x_val, y=yl, mode='lines', name='Lower', line=dict(color='firebrick', width=2),
+                             fill='tonexty', fillcolor='rgba(200, 200, 200, 0.2)'))
+    fig.add_trace(
+        go.Scatter(x=x_val, y=c_dist, mode='lines', name='Camber', line=dict(color='black', width=1, dash='dash')))
 
-    # Upper Surface
-    fig.add_trace(go.Scatter(
-        x=x_val, y=yu, mode='lines', name='Upper',
-        line=dict(color='royalblue', width=2)
-    ))
-
-    # Lower Surface
-    fig.add_trace(go.Scatter(
-        x=x_val, y=yl, mode='lines', name='Lower',
-        line=dict(color='firebrick', width=2),
-        fill='tonexty',  # Fill area between traces
-        fillcolor='rgba(200, 200, 200, 0.2)'
-    ))
-
-    # Camber Line
-    fig.add_trace(go.Scatter(
-        x=x_val, y=c_dist, mode='lines', name='Camber',
-        line=dict(color='black', width=1, dash='dash')
-    ))
-
-    # Layout styling
     fig.update_layout(
         title="Generated Airfoil Geometry",
-        xaxis_title="x/c",
-        yaxis_title="y/c",
-        yaxis=dict(
-            scaleanchor="x",
-            scaleratio=1,
-            range=[-0.5, 0.5]
-        ),
+        xaxis_title="x/c", yaxis_title="y/c",
+        yaxis=dict(scaleanchor="x", scaleratio=1, range=[-0.5, 0.5]),
         xaxis=dict(range=[-0.05, 1.05]),
-        margin=dict(l=20, r=20, t=40, b=20),
-        height=500,
-        showlegend=True
+        margin=dict(l=20, r=20, t=40, b=20), height=400, showlegend=True
     )
 
-    return fig
+    # 5. Performance Text Generation
+    l_d_ratio = cl / (cd + 1e-6)
+
+    perf_html = f"""
+    <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; border: 1px solid #e5e7eb;">
+        <h3 style="margin-top:0; color: #374151;">Aerodynamic Performance</h3>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+            <div><strong style="color: black;">Lift (CL):</strong> <span style="color: blue;">{cl:.4f}</span></div>
+            <div><strong  style="color: black;">Drag (CD):</strong> <span style="color: red;">{cd:.5f}</span></div>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+            <div><strong style="color: black;">Moment (CM) :</strong> <span style="color: purple;">{cm:.4f}</span></div>
+            <div><strong style="color: black;">L/D Ratio:</strong> <span style="color: green; font-weight: bold;">{l_d_ratio:.2f}</span></div>
+        </div>
+    </div>
+    """
+
+    return fig, perf_html
 
 
 # ============================================================================
 # 5. GRADIO UI LAYOUT
 # ============================================================================
-with gr.Blocks(title="Airfoil VAE Explorer") as demo:
-    gr.Markdown("# Interactive Airfoil VAE Explorer")
+with gr.Blocks(title="Airfoil VAE & Aero Surrogate Explorer", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Airfoil Design & Performance Explorer")
     gr.Markdown(
-        "Adjust the sliders to explore the latent space. The model runs in the background and updates the geometry.")
+        "Modify geometry (left) and operating conditions (right) to see real-time shape and aerodynamic predictions.")
 
     with gr.Row():
-        # --- LEFT COLUMN: CONTROLS ---
+        # --- LEFT COLUMN: GEOMETRY ---
         with gr.Column(scale=1):
-            with gr.Group():
-                gr.Markdown("### Thickness Branch")
-                gr.Markdown("**Physical Properties**")
+            gr.Markdown("### 1. Geometry Controls (Latent Space)")
+            with gr.Tab("Thickness"):
                 t_max = gr.Slider(-4, 4, value=0, label="Max Thickness", step=0.1)
                 t_pos = gr.Slider(-4, 4, value=0, label="Pos Max Thickness", step=0.1)
                 t_le = gr.Slider(-4, 4, value=0, label="LE Radius", step=0.1)
+                t_f1 = gr.Slider(-4, 4, value=0, label="Free Var 1", step=0.1)
+                t_f2 = gr.Slider(-4, 4, value=0, label="Free Var 2", step=0.1)
+                t_f3 = gr.Slider(-4, 4, value=0, label="Free Var 3", step=0.1)
 
-                gr.Markdown("**Free Variables**")
-                t_f1 = gr.Slider(-4, 4, value=0, label="Free 1", step=0.1)
-                t_f2 = gr.Slider(-4, 4, value=0, label="Free 2", step=0.1)
-                t_f3 = gr.Slider(-4, 4, value=0, label="Free 3", step=0.1)
-
-            with gr.Group():
-                gr.Markdown("### Camber Branch")
-                gr.Markdown("**Physical Properties**")
+            with gr.Tab("Camber"):
                 c_max = gr.Slider(-4, 4, value=0, label="Max Camber", step=0.1)
                 c_pos = gr.Slider(-4, 4, value=0, label="Pos Max Camber", step=0.1)
+                c_f1 = gr.Slider(-4, 4, value=0, label="Free Var 1", step=0.1)
+                c_f2 = gr.Slider(-4, 4, value=0, label="Free Var 2", step=0.1)
 
-                gr.Markdown("**Free Variables**")
-                c_f1 = gr.Slider(-4, 4, value=0, label="Free 1", step=0.1)
-                c_f2 = gr.Slider(-4, 4, value=0, label="Free 2", step=0.1)
-
-        # --- RIGHT COLUMN: PLOT ---
+        # --- RIGHT COLUMN: CONDITIONS & RESULTS ---
         with gr.Column(scale=2):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 2. Operating Conditions")
+                    mach = gr.Slider(0.0, 1.0, value=0.4, label="Mach Number", step=0.05)
+                    alpha = gr.Slider(-10.0, 15.0, value=2.0, label="Alpha (Angle of Attack)", step=0.5)
+                    reynolds = gr.Slider(1e5, 5e6, value=1e6, label="Reynolds Number", step=1e5)
+
+                with gr.Column():
+                    gr.Markdown("### 3. Prediction")
+                    perf_output = gr.HTML(label="Performance")
+
             plot_output = gr.Plot(label="Airfoil Geometry")
 
-    # Inputs list must match function arguments
-    inputs = [t_max, t_pos, t_le, t_f1, t_f2, t_f3, c_max, c_pos, c_f1, c_f2]
+    # Inputs list (Geometry + Physics)
+    inputs = [t_max, t_pos, t_le, t_f1, t_f2, t_f3,
+              c_max, c_pos, c_f1, c_f2,
+              mach, reynolds, alpha]
 
-    # Event listeners
-    # Trigger update on any slider change
-    for slider in inputs:
-        slider.change(fn=update_geometry, inputs=inputs, outputs=plot_output)
+    # Outputs
+    outputs = [plot_output, perf_output]
 
-    # Initial load
-    demo.load(fn=update_geometry, inputs=inputs, outputs=plot_output)
+    # Triggers
+    for inp in inputs:
+        inp.change(fn=update_prediction, inputs=inputs, outputs=outputs)
+
+    # Initial Load
+    demo.load(fn=update_prediction, inputs=inputs, outputs=outputs)
 
 if __name__ == "__main__":
     demo.launch()
