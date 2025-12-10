@@ -16,16 +16,16 @@ from scipy.interpolate import interp1d
 # ============================================================================
 # Training Hyperparameters
 BATCH_SIZE = 64
-EPOCHS = 20
+EPOCHS = 30
 LR = 1e-3
 CLIP_GRAD = 1.0
-LR_PATIENCE = 10
+LR_PATIENCE = 4
 LR_FACTOR = 0.5
 
 # Architecture
 # Thickness Branch: Max Thickness, Pos Max Thickness, LE Radius (3 vars)
 LATENT_PHYS_THICK = 3
-LATENT_FREE_THICK = 3  # 1 free per aligned variable
+LATENT_FREE_THICK = 3  # 2 free per aligned variable
 
 # Camber Branch: Max Camber, Pos Max Camber (2 vars)
 LATENT_PHYS_CAMBER = 2
@@ -39,7 +39,9 @@ DEC_LAYERS = 2 # Number of layers in decoder
 DEC_NODES = 64 #
 
 # Data
-DATA_DIR = './data/airfoil/beziergan_gen'
+#DATA_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'
+DATA_DIR = '../VAEBladerData/data/airfoil/naca_gen'
+
 MAX_FILES = None # Set to None to use all files
 
 

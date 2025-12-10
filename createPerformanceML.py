@@ -16,8 +16,11 @@ from createPIVAE import AirfoilVAE, SEQ_LEN, NUM_CP, DEVICE
 # 1. CONFIGURATION
 # ============================================================================
 VAE_MODEL_PATH = './results/model/airfoil_vae.pth'
-AIRFOIL_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'  # Contains 00000.dat
-POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/beziergan_gen'  # Contains folders 00000/, 00001/
+#AIRFOIL_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'  # Contains 00000.dat
+#POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/beziergan_gen'  # Contains folders 00000/, 00001/
+
+AIRFOIL_DIR = '../VAEBladerData/data/airfoil/naca_gen'  # Contains 00000.dat
+POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/naca_gen'  # Contains folders 00000/, 00001/
 
 BATCH_SIZE = 64
 LR = 1e-3

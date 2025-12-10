@@ -33,8 +33,8 @@ VAE_MODEL_PATH = './results/model/airfoil_vae.pth'
 SURROGATE_MODEL_PATH = './results/model/aero_surrogate.pth'
 
 # Data Paths (Reference only, not needed for inference)
-AIRFOIL_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'
-POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/beziergan_gen'
+#AIRFOIL_DIR = '../VAEBladerData/data/airfoil/beziergan_gen'
+#POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/beziergan_gen'
 
 SEQ_LEN = 200
 NUM_CP = 15
