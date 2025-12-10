@@ -12,8 +12,9 @@ import re
 from scipy.interpolate import interp1d
 
 # --- IMPORTS FROM TRAINING SCRIPT ---
-# We import the Model, B-Spline Tool, and Constants
-from createPIVAE_refactor_LE_and_Input import encode_airfoil_data, AG_VAE, BSplineTransform, SEQ_LEN, NUM_CP, DEVICE
+# This ensures we use the exact same B-Spline topology (Clustered Knots) and Model Arch
+from createPIVAE_refactor_LE_and_Input import AG_VAE, BSplineTransform, SEQ_LEN, NUM_CP, DEVICE
+
 # ============================================================================
 # 1. CONFIGURATION
 # ============================================================================
@@ -25,7 +26,9 @@ BATCH_SIZE = 64
 LR = 1e-3
 EPOCHS = 30
 
-# We use the imported DEVICE for training, but force CPU for generation
+# Device Strategy:
+# 1. Training (Surrogate) -> Fast Device (MPS/CUDA)
+# 2. Data Gen (B-Spline Fitting) -> CPU (To avoid MPS linalg.solve crashes)
 TRAIN_DEVICE = DEVICE
 GEN_DEVICE = torch.device('cpu')
 
@@ -36,7 +39,9 @@ print(f"Training on: {TRAIN_DEVICE} | Data Gen on: {GEN_DEVICE}")
 # 2. HELPER FUNCTIONS
 # ============================================================================
 def process_airfoil_to_latents(fpath, vae, bspline_tool, device):
-    """ Loads dat file, fits CPs, and encodes to z using VAE """
+    """
+    Loads dat file, fits CPs using the Hybrid Topology, and encodes to z.
+    """
     try:
         # Load .dat
         with open(fpath, 'r') as f:
@@ -63,24 +68,30 @@ def process_airfoil_to_latents(fpath, vae, bspline_tool, device):
         yc = (yu + yl) / 2.0
         yt[-1] = yc[0] = yc[-1] = 0.0
 
-        # # Fit Control Points (Use Passed Device - CPU)
-        # yt_ten = torch.tensor(yt, dtype=torch.float32, device=device).unsqueeze(0)
-        # yc_ten = torch.tensor(yc, dtype=torch.float32, device=device).unsqueeze(0)
-        #
-        # # Use the tool imported from the training script
-        # # 1. Thickness: Vertical LE (Round nose)
-        # cps_t = bspline_tool.fit_vertical_le(yt_ten)
-        # # 2. Camber: Standard Fit (Free inlet angle)
-        # cps_c = bspline_tool.fit_standard(yc_ten)
-        #
-        # # Encode
-        # mu_t, _ = vae.enc_thick(cps_t.squeeze(0).unsqueeze(0))
-        # mu_c, _ = vae.enc_camber(cps_c.squeeze(0).unsqueeze(0))
-        #
-        # # Concat Latents [1, 12]
-        # z = torch.cat([mu_t, mu_c], dim=1).detach().cpu().numpy()[0]
-        # return z
-        return encode_airfoil_data(vae, bspline_tool, yt, yc, device)
+        # Prepare Tensors on Generation Device (CPU)
+        yt_ten = torch.tensor(yt, dtype=torch.float32, device=device).unsqueeze(0)
+        yc_ten = torch.tensor(yc, dtype=torch.float32, device=device).unsqueeze(0)
+
+        # --- HYBRID FITTING (Must match Training Logic) ---
+        # 1. Thickness: Vertical LE (Round nose, Clustered Knots)
+        cps_t = bspline_tool.fit_vertical_le(yt_ten)
+
+        # 2. Camber: Standard Fit (Free inlet angle)
+        # We use fit_standard (which might alias fit_vertical_le in code, but conceptually distinct)
+        if hasattr(bspline_tool, 'fit_standard'):
+            cps_c = bspline_tool.fit_standard(yc_ten)
+        else:
+            # Fallback if fit_standard isn't defined yet, but logically they use same solver
+            cps_c = bspline_tool.fit_vertical_le(yc_ten)
+
+        # Encode
+        # Input to encoder is [1, 16] Control Points
+        mu_t, _ = vae.enc_thick(cps_t)
+        mu_c, _ = vae.enc_camber(cps_c)
+
+        # Concat Latents [1, 12]
+        z = torch.cat([mu_t, mu_c], dim=1).detach().cpu().numpy()[0]
+        return z
 
     except Exception as e:
         return None
@@ -145,6 +156,7 @@ def main():
     vae = AG_VAE(num_cp=NUM_CP, seq_len=SEQ_LEN, device=GEN_DEVICE).to(GEN_DEVICE)
     try:
         # strict=False allows us to load encoders even if decoders mismatch slightly
+        # (e.g., if you have dummy decoders in one script and full in another)
         vae.load_state_dict(torch.load(VAE_MODEL_PATH, map_location=GEN_DEVICE), strict=False)
         print("VAE weights loaded.")
     except Exception as e:
@@ -152,7 +164,7 @@ def main():
         return
     vae.eval()
 
-    # Initialize B-Spline tool using imported class
+    # Initialize B-Spline tool using imported class (Inherits Clustered Knots)
     bspline_tool = BSplineTransform(NUM_CP, degree=3, num_eval=SEQ_LEN, device=GEN_DEVICE)
 
     # 2. Build Dataset (On CPU)
@@ -190,9 +202,11 @@ def main():
         print("Error: No valid data pairs found. Check paths.")
         return
 
-    # 3. Train Surrogate (Move to TRAIN_DEVICE)
+    # 3. Train Surrogate (Move to TRAIN_DEVICE for speed)
     ds = torch.utils.data.TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    train, val = random_split(ds, [int(0.9 * len(X)), len(X) - int(0.9 * len(X))])
+    train_sz = int(0.9 * len(X))
+    train, val = random_split(ds, [train_sz, len(X) - train_sz])
+
     train_dl = DataLoader(train, BATCH_SIZE, shuffle=True)
     val_dl = DataLoader(val, BATCH_SIZE)
 
@@ -215,6 +229,7 @@ def main():
 
         if ep % 5 == 0:
             surrogate.eval()
+            # Validation loop on TRAIN_DEVICE
             vl = sum([crit(surrogate(bx.to(TRAIN_DEVICE)), by.to(TRAIN_DEVICE)).item() for bx, by in val_dl])
             print(f"Ep {ep}: Train {tl / len(train_dl):.5f} | Val {vl / len(val_dl):.5f}")
 

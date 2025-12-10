@@ -63,23 +63,33 @@ class BSplineTransform(nn.Module):
         self.degree = degree
         self.device = device
 
-        # 1. Evaluation Grid (Cosine Spacing for higher resolution at LE)
+        # 1. Evaluation Grid (Cosine Spacing)
         theta = torch.linspace(0, np.pi, num_eval, device=device)
         self.u = 0.5 * (1 - torch.cos(theta))
 
-        # 2. Basis Matrix
-        self.basis = self._precompute_basis(self.u).to(device)
+        # 2. Clustered Knot Vector (The "Additional Set" for LE)
+        # We manually define knots to cluster density at the leading edge.
+        # This allocates ~30% of control points to the first 10% of the chord.
+        self.basis = self._precompute_basis_clustered(self.u).to(device)
 
-    def _precompute_basis(self, u):
-        n, p = self.num_cp - 1, self.degree
+    def _precompute_basis_clustered(self, u):
+        p = self.degree
+        n = self.num_cp - 1
         m = n + p + 1
+
+        # --- CUSTOM KNOT VECTOR ---
+        # We want high density near 0.
+        # Internal knots: (num_cp - 1 - degree) = 16 - 1 - 3 = 12 internal knots
+
+        # We generate knots using a power law (x^2) to cluster them near 0
+        internal_knots = torch.linspace(0, 1, m - 2 * p, device=u.device)
+        internal_knots = internal_knots ** 2  # <--- CLUSTERING MAGIC
+
         kv = torch.zeros(m + 1, device=u.device)
+        kv[p + 1: m - p + 1] = internal_knots  # Fill internal
+        kv[m - p + 1:] = 1.0  # Clamp end
 
-        # Clamped Knot Vector
-        start, end = p + 1, m - p
-        kv[start:end] = torch.linspace(0, 1, end - start + 2, device=u.device)[1:-1]
-        kv[end:] = 1.0
-
+        # Cox-de Boor Recursion (Standard)
         N = torch.zeros(u.shape[0], m, device=u.device)
         for i in range(m):
             mask = (u >= kv[i]) & (u < kv[i + 1])
@@ -95,48 +105,37 @@ class BSplineTransform(nn.Module):
                 t2 = ((kv[i + d + 1] - u) / d2) * N[:, i + 1] if d2 > 1e-6 else 0.0
                 N_new[:, i] = t1 + t2
             N = N_new
+
         return N[:, :self.num_cp]
 
     def forward(self, cp_y):
-        """ Evaluate Curve Y-coordinates. CP X-coords are implicit. """
         return torch.matmul(cp_y, self.basis.T)
 
     def fit_vertical_le(self, target_y, lambda_smooth=0.005):
-        """
-        Fits CPs to target_y while enforcing VERTICAL TANGENT at LE.
-        Constraint: CP_0.y = 0 AND CP_1.x = 0 (Implicitly handled by X distribution)
-        We fit CP indices 1..N-1 (CP_0 is fixed to 0.0)
-        """
-        # M_reduced corresponds to basis functions 1..N (Skipping 0)
+        # Basis matrix for indices 1..N (Skip index 0 which is fixed at 0)
         M_red = self.basis[:, 1:]
 
         gram = torch.matmul(M_red.T, M_red)
 
-        # Smoothness Regularization (2nd derivative)
-        D2 = torch.zeros(self.num_cp - 3, self.num_cp - 1, device=self.device)
-        for i in range(self.num_cp - 3):
-            D2[i, i] = 1
-            D2[i, i + 1] = -2
+        # Regularization matrix must match dimensions
+        # num_free = num_cp - 1
+        n_free = self.num_cp - 1
+        D2 = torch.zeros(n_free - 2, n_free, device=self.device)
+        for i in range(n_free - 2):
+            D2[i, i] = 1;
+            D2[i, i + 1] = -2;
             D2[i, i + 2] = 1
+
         reg = lambda_smooth * torch.matmul(D2.T, D2)
 
-        A = gram + reg + 1e-6 * torch.eye(self.num_cp - 1, device=self.device)
-        b = torch.matmul(M_red.T, target_y.T)  # [Num_CP-1, Batch]
+        A = gram + reg + 1e-6 * torch.eye(n_free, device=self.device)
+        b = torch.matmul(M_red.T, target_y.T)
+        cp_free = torch.linalg.solve(A, b).T
 
-        cp_free = torch.linalg.solve(A, b).T  # [Batch, Num_CP-1]
-
-        # Concat fixed CP_0 (0.0)
         zeros = torch.zeros(cp_free.shape[0], 1, device=self.device)
         return torch.cat([zeros, cp_free], dim=1)
 
     def fit_standard(self, target_y, lambda_smooth=0.005):
-        """
-        Fits CPs for Camber (Standard Fit).
-        Constraint: CP_0.y = 0. CP_1 is FREE to determine inlet angle.
-        """
-        # Uses the same mathematical solver as vertical_le (solving for P_y),
-        # but logically distinct. CP_1 here represents the curve value at
-        # standard cosine spacing, allowing for any inlet slope.
         return self.fit_vertical_le(target_y, lambda_smooth)
 
 
@@ -204,42 +203,27 @@ class AG_VAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z_t, z_c):
-        """
-        Generates curves and control points from latent vectors.
-        Now exposed for visualization scripts.
-        """
-        # 1. Decode Free CPs (1..N)
-        #cp_t_free = self.dec_thick(z_t)
-        #cp_c_free = self.dec_camber(z_c)
-
         cp_t_raw = self.dec_thick(z_t)
         cp_c_free = self.dec_camber(z_c)
 
-        ## 2. Thickness Constraints: Positivity + Vertical LE Bias
-        ## Softplus + bias ensures CP_1 > 0, preventing sharp nose collapse
-        #cp_t_free = F.softplus(cp_t_free) + 1e-3
-        # --- FIX FOR SHARP LEADING EDGE ---
-        # We split the Thickness CPs into "Nose CP" (Index 0) and "Body CPs" (Indices 1:)
-        # We enforce a larger minimum value (0.005) on the Nose CP to guarantee a round radius.
+        # --- REFINED CONSTRAINTS FOR CLUSTERED KNOTS ---
+        # Due to clustering, CP indices 0, 1, 2 are all "Nose Points".
+        # We apply the bias to the first TWO free points (Index 0 and 1 of raw, which are CP_1 and CP_2)
 
-        # CP_1 (Nose)
-        cp_t_nose = F.softplus(cp_t_raw[:, 0:1]) + 0.005
+        # 1. Nose Region (CP_1, CP_2): Ensure minimum thickness
+        cp_t_nose = F.softplus(cp_t_raw[:, 0:2]) + 0.005
 
-        # CP_2...N (Body) - Keep standard small epsilon
-        cp_t_body = F.softplus(cp_t_raw[:, 1:]) + 1e-4
+        # 2. Body Region (CP_3...): Standard positivity
+        cp_t_body = F.softplus(cp_t_raw[:, 2:]) + 1e-4
 
         # Recombine
         cp_t_free = torch.cat([cp_t_nose, cp_t_body], dim=1)
 
-        # 3. Camber Constraints: None
-        # We allow CP_1 to be negative or positive to capture any inlet angle.
-
-        # Concat Fixed CP_0 = 0.0
+        # ... rest same as before ...
         zeros = torch.zeros(cp_t_free.shape[0], 1, device=self.device)
         cp_t = torch.cat([zeros, cp_t_free], dim=1)
         cp_c = torch.cat([zeros, cp_c_free], dim=1)
 
-        # 4. Generate Curves
         t_out = self.bspline(cp_t)
         c_out = self.bspline(cp_c)
 
@@ -366,43 +350,59 @@ class RealAirfoilDataset(Dataset):
 # ============================================================================
 # 5. LOSS FUNCTION
 # ============================================================================
-def loss_function(rec_x, true_x, rec_cp, true_cp,
-                  mt, lt, mc, lc, feat, p_lv, ep, model):
-    # 1. Reconstruction (Weighted Kulfan Tolerance style)
-    # Weight LE more heavily
+def loss_function(rec_x, true_x, rec_cp, true_cp, mt, lt, mc, lc, feat, p_lv, ep, model):
+    # 1. Reconstruction (Weighted Kulfan Tolerance)
     weights = torch.ones_like(true_x)
-    weights[:, :, :40] = 5.0  # Boost first 20% points
-
+    weights[:, :, :40] = 20.0  # High priority on LE
     mse_x = torch.sum(weights * (rec_x - true_x) ** 2)
-    mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')  # Guidance for CPs
 
-    # 2. Physics Loss (Latent Consistency)
-    # Calculate physics from RECONSTRUCTED curve
+    # 2. Control Point Guidance
+    mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')
+
+    # 3. Physics Loss (Latent Consistency)
     p_t_rec, p_c_rec = model.calculate_physics(rec_x[:, 0], rec_x[:, 1])
-
-    # Normalize (Using batch stats for simplicity, or pre-calc stats)
-    # Here we compare directly to the Normalized Feature Target
-    # But since 'p_t_rec' is raw physics, we need to normalize it to match 'feat'
-    # For stability in this script, we assume 'feat' is the truth and minimize latent distance
-
-    # Latent Physics Loss: Latent vs True Feature
     kl_phys_t = 0.5 * torch.sum((mt[:, :3] - feat[:, :3]) ** 2)
     kl_phys_c = 0.5 * torch.sum((mc[:, :3] - feat[:, 3:]) ** 2)
 
-    # 3. KL Divergence
+    # 4. KL Divergence (Latent Regularization)
     kl_div = 0.0
     for m, l in [(mt, lt), (mc, lc)]:
         kl_div += -0.5 * torch.sum(1 + l - m.pow(2) - l.exp())
 
-    # 4. Smoothness (Regularize 2nd derivative of CPs)
-    diff_t = rec_cp[:, 0, 2:] - 2 * rec_cp[:, 0, 1:-1] + rec_cp[:, 0, :-2]
-    diff_c = rec_cp[:, 1, 2:] - 2 * rec_cp[:, 1, 1:-1] + rec_cp[:, 1, :-2]
+    # 5. "Body-Only" Smoothness
+    # We ignore the first 3 indices (Nose region) to allow high curvature there.
+    # We only penalize "wiggles" in the main body and trailing edge.
+    # indices: [start_index:] -> [3:] means we skip P0, P1, P2
+
+    # Thickness Smoothness
+    cp_t_body = rec_cp[:, 0, 3:]
+    diff_t = cp_t_body[:, 2:] - 2 * cp_t_body[:, 1:-1] + cp_t_body[:, :-2]
+
+    # Camber Smoothness
+    cp_c_body = rec_cp[:, 1, 3:]
+    diff_c = cp_c_body[:, 2:] - 2 * cp_c_body[:, 1:-1] + cp_c_body[:, :-2]
+
     reg_smooth = torch.sum(diff_t ** 2) + torch.sum(diff_c ** 2)
 
-    beta = min(0.5, ep / 15.0)
+    # --- ANNEALING SCHEDULES ---
+    # Beta (KL): Ramp up to 0.5 over 20 epochs
+    beta = min(0.5, ep / 20.0)
 
-    loss = mse_x + 10.0 * mse_cp + beta * kl_div + 10.0 * (kl_phys_t + kl_phys_c) + 100.0 * reg_smooth
+    # Alpha (Physics): Ramp up to 10.0 over 30 epochs
+    # This lets the model learn "How to draw an airfoil" first (0-10 epochs),
+    # and then learns "What the variables mean" (10-30 epochs).
+    alpha_phys = min(10.0, ep / 3.0)
 
+    loss = mse_x + 10.0 * mse_cp + beta * kl_div + alpha_phys * (kl_phys_t + kl_phys_c) + 100.0 * reg_smooth
+
+    return {
+        "loss": loss,
+        "rec": mse_x.item(),
+        "cp": mse_cp.item(),
+        "kl": kl_div.item(),
+        "phys": (kl_phys_t + kl_phys_c).item(),
+        "smooth": reg_smooth.item()
+    }
     return {
         "loss": loss,
         "rec": mse_x.item(),
