@@ -13,8 +13,7 @@ from scipy.interpolate import interp1d
 
 # --- IMPORTS FROM TRAINING SCRIPT ---
 # We import the Model, B-Spline Tool, and Constants
-from createPIVAE_refactor_LE_and_Input import AG_VAE, BSplineTransform, SEQ_LEN, NUM_CP, DEVICE
-
+from createPIVAE_refactor_LE_and_Input import encode_airfoil_data, AG_VAE, BSplineTransform, SEQ_LEN, NUM_CP, DEVICE
 # ============================================================================
 # 1. CONFIGURATION
 # ============================================================================
@@ -64,21 +63,24 @@ def process_airfoil_to_latents(fpath, vae, bspline_tool, device):
         yc = (yu + yl) / 2.0
         yt[-1] = yc[0] = yc[-1] = 0.0
 
-        # Fit Control Points (Use Passed Device - CPU)
-        yt_ten = torch.tensor(yt, dtype=torch.float32, device=device).unsqueeze(0)
-        yc_ten = torch.tensor(yc, dtype=torch.float32, device=device).unsqueeze(0)
-
-        # Use the tool imported from the training script
-        cps_t = bspline_tool.fit_vertical_le(yt_ten)
-        cps_c = bspline_tool.fit_vertical_le(yc_ten)
-
-        # Encode
-        mu_t, _ = vae.enc_thick(cps_t.squeeze(0).unsqueeze(0))
-        mu_c, _ = vae.enc_camber(cps_c.squeeze(0).unsqueeze(0))
-
-        # Concat Latents [1, 12]
-        z = torch.cat([mu_t, mu_c], dim=1).detach().cpu().numpy()[0]
-        return z
+        # # Fit Control Points (Use Passed Device - CPU)
+        # yt_ten = torch.tensor(yt, dtype=torch.float32, device=device).unsqueeze(0)
+        # yc_ten = torch.tensor(yc, dtype=torch.float32, device=device).unsqueeze(0)
+        #
+        # # Use the tool imported from the training script
+        # # 1. Thickness: Vertical LE (Round nose)
+        # cps_t = bspline_tool.fit_vertical_le(yt_ten)
+        # # 2. Camber: Standard Fit (Free inlet angle)
+        # cps_c = bspline_tool.fit_standard(yc_ten)
+        #
+        # # Encode
+        # mu_t, _ = vae.enc_thick(cps_t.squeeze(0).unsqueeze(0))
+        # mu_c, _ = vae.enc_camber(cps_c.squeeze(0).unsqueeze(0))
+        #
+        # # Concat Latents [1, 12]
+        # z = torch.cat([mu_t, mu_c], dim=1).detach().cpu().numpy()[0]
+        # return z
+        return encode_airfoil_data(vae, bspline_tool, yt, yc, device)
 
     except Exception as e:
         return None

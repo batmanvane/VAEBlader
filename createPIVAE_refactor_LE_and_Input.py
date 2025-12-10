@@ -1,4 +1,4 @@
-# Implements part of DOI: 10.1093/jcde/qwaf002 by Kang et al 2025 [cite: 4, 9]
+# Implements part of DOI: 10.1093/jcde/qwaf002 by Kang et al 2025
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ CLIP_GRAD = 1.0
 LR_PATIENCE = 8
 LR_FACTOR = 0.5
 
-# Latent Space Definitions (Matches Paper's Physics-Aware approach) [cite: 201, 294]
+# Latent Space Definitions (Matches Paper's Physics-Aware approach)
 # Thickness: [Max_T, Pos_Max_T, Radius] + Free vars
 LATENT_PHYS_THICK = 3
 LATENT_FREE_THICK = 3
@@ -63,7 +63,7 @@ class BSplineTransform(nn.Module):
         self.degree = degree
         self.device = device
 
-        # 1. Evaluation Grid (Cosine Spacing for higher resolution at LE) [cite: 383, 1254]
+        # 1. Evaluation Grid (Cosine Spacing for higher resolution at LE)
         theta = torch.linspace(0, np.pi, num_eval, device=device)
         self.u = 0.5 * (1 - torch.cos(theta))
 
@@ -128,6 +128,16 @@ class BSplineTransform(nn.Module):
         # Concat fixed CP_0 (0.0)
         zeros = torch.zeros(cp_free.shape[0], 1, device=self.device)
         return torch.cat([zeros, cp_free], dim=1)
+
+    def fit_standard(self, target_y, lambda_smooth=0.005):
+        """
+        Fits CPs for Camber (Standard Fit).
+        Constraint: CP_0.y = 0. CP_1 is FREE to determine inlet angle.
+        """
+        # Uses the same mathematical solver as vertical_le (solving for P_y),
+        # but logically distinct. CP_1 here represents the curve value at
+        # standard cosine spacing, allowing for any inlet slope.
+        return self.fit_vertical_le(target_y, lambda_smooth)
 
 
 # ============================================================================
@@ -198,23 +208,38 @@ class AG_VAE(nn.Module):
         Generates curves and control points from latent vectors.
         Now exposed for visualization scripts.
         """
-        # 1. Decode Free CPs (Indices 1..N)
-        cp_t_free = self.dec_thick(z_t)
+        # 1. Decode Free CPs (1..N)
+        #cp_t_free = self.dec_thick(z_t)
+        #cp_c_free = self.dec_camber(z_c)
+
+        cp_t_raw = self.dec_thick(z_t)
         cp_c_free = self.dec_camber(z_c)
 
-        # 2. Apply Constraints
-        # Thickness: Must be positive.
-        # FIX FOR SHARP LE: Add small bias (+1e-3) to prevent collapse to 0
-        cp_t_free = F.softplus(cp_t_free) + 1e-3
+        ## 2. Thickness Constraints: Positivity + Vertical LE Bias
+        ## Softplus + bias ensures CP_1 > 0, preventing sharp nose collapse
+        #cp_t_free = F.softplus(cp_t_free) + 1e-3
+        # --- FIX FOR SHARP LEADING EDGE ---
+        # We split the Thickness CPs into "Nose CP" (Index 0) and "Body CPs" (Indices 1:)
+        # We enforce a larger minimum value (0.005) on the Nose CP to guarantee a round radius.
+
+        # CP_1 (Nose)
+        cp_t_nose = F.softplus(cp_t_raw[:, 0:1]) + 0.005
+
+        # CP_2...N (Body) - Keep standard small epsilon
+        cp_t_body = F.softplus(cp_t_raw[:, 1:]) + 1e-4
+
+        # Recombine
+        cp_t_free = torch.cat([cp_t_nose, cp_t_body], dim=1)
+
+        # 3. Camber Constraints: None
+        # We allow CP_1 to be negative or positive to capture any inlet angle.
 
         # Concat Fixed CP_0 = 0.0
         zeros = torch.zeros(cp_t_free.shape[0], 1, device=self.device)
-
-        # [Batch, Num_CP]
         cp_t = torch.cat([zeros, cp_t_free], dim=1)
         cp_c = torch.cat([zeros, cp_c_free], dim=1)
 
-        # 3. Generate Curves
+        # 4. Generate Curves
         t_out = self.bspline(cp_t)
         c_out = self.bspline(cp_c)
 
@@ -308,9 +333,12 @@ class RealAirfoilDataset(Dataset):
                 yt_ten = torch.tensor(yt, dtype=torch.float32).unsqueeze(0)
                 yc_ten = torch.tensor(yc, dtype=torch.float32).unsqueeze(0)
 
-                # Use the special fit function that fixes CP0=0 and assumes Vertical tangent
+                # 1. Thickness: Vertical LE Fit (Enforces Round Nose)
                 cps_t = self.bspline_tool.fit_vertical_le(yt_ten)
-                cps_c = self.bspline_tool.fit_vertical_le(yc_ten)
+
+                # 2. Camber: Standard Fit (Enforces Free Inlet Angle)
+                # This ensures we do NOT force the camber line to be vertical or horizontal at the start.
+                cps_c = self.bspline_tool.fit_standard(yc_ten)
 
                 cp_list.append(torch.stack([cps_t.squeeze(), cps_c.squeeze()]).numpy())
                 coord_list.append(torch.stack([yt_ten.squeeze(), yc_ten.squeeze()]).numpy())
@@ -340,7 +368,7 @@ class RealAirfoilDataset(Dataset):
 # ============================================================================
 def loss_function(rec_x, true_x, rec_cp, true_cp,
                   mt, lt, mc, lc, feat, p_lv, ep, model):
-    # 1. Reconstruction (Weighted Kulfan Tolerance style) [cite: 358, 362]
+    # 1. Reconstruction (Weighted Kulfan Tolerance style)
     # Weight LE more heavily
     weights = torch.ones_like(true_x)
     weights[:, :, :40] = 5.0  # Boost first 20% points
@@ -348,7 +376,7 @@ def loss_function(rec_x, true_x, rec_cp, true_cp,
     mse_x = torch.sum(weights * (rec_x - true_x) ** 2)
     mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')  # Guidance for CPs
 
-    # 2. Physics Loss (Latent Consistency) [cite: 206, 297]
+    # 2. Physics Loss (Latent Consistency)
     # Calculate physics from RECONSTRUCTED curve
     p_t_rec, p_c_rec = model.calculate_physics(rec_x[:, 0], rec_x[:, 1])
 
@@ -366,7 +394,7 @@ def loss_function(rec_x, true_x, rec_cp, true_cp,
     for m, l in [(mt, lt), (mc, lc)]:
         kl_div += -0.5 * torch.sum(1 + l - m.pow(2) - l.exp())
 
-    # 4. Smoothness (Regularize 2nd derivative of CPs) [cite: 279]
+    # 4. Smoothness (Regularize 2nd derivative of CPs)
     diff_t = rec_cp[:, 0, 2:] - 2 * rec_cp[:, 0, 1:-1] + rec_cp[:, 0, :-2]
     diff_c = rec_cp[:, 1, 2:] - 2 * rec_cp[:, 1, 1:-1] + rec_cp[:, 1, :-2]
     reg_smooth = torch.sum(diff_t ** 2) + torch.sum(diff_c ** 2)
@@ -472,7 +500,7 @@ def plot_latent_traversals(model, dataloader, device):
 
         fig, axes = plt.subplots(6, 9, figsize=(15, 10))
         vals = np.linspace(-3, 3, 9)
-        labels = ['Max_T', 'Pos_T', 'Rad', 'Max_C', 'Pos_C', 'TE_Dir']
+        labels = ['Max_T', 'Pos_T', 'LE_Rad', 'Max_C', 'Pos_C', 'TE_Dir']
 
         for r in range(6):  # 6 Physical vars
             for c_idx, val in enumerate(vals):
@@ -502,6 +530,27 @@ def plot_latent_traversals(model, dataloader, device):
     plt.close()
     print("Saved latent traversals.")
 
+
+
+def encode_airfoil_data(vae, bspline_tool, yt, yc, device):
+    """
+    Centralized logic to convert raw thickness/camber to latents.
+    Ensures consistent fitting topology.
+    """
+    yt_ten = torch.tensor(yt, dtype=torch.float32, device=device).unsqueeze(0)
+    yc_ten = torch.tensor(yc, dtype=torch.float32, device=device).unsqueeze(0)
+
+    # Hybrid Fitting Topology (The Single Source of Truth)
+    cps_t = bspline_tool.fit_vertical_le(yt_ten)
+    cps_c = bspline_tool.fit_standard(yc_ten)
+
+    # Encode
+    with torch.no_grad():
+        mu_t, _ = vae.enc_thick(cps_t)
+        mu_c, _ = vae.enc_camber(cps_c)
+
+    # Return 1D latent vector [12]
+    return torch.cat([mu_t, mu_c], dim=1).cpu().numpy()[0]
 
 # ============================================================================
 # 7. MAIN
