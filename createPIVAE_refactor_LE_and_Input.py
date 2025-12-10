@@ -385,13 +385,16 @@ def loss_function(rec_x, true_x, rec_cp, true_cp, mt, lt, mc, lc, feat, p_lv, ep
     reg_smooth = torch.sum(diff_t ** 2) + torch.sum(diff_c ** 2)
 
     # --- ANNEALING SCHEDULES ---
-    # Beta (KL): Ramp up to 0.5 over 20 epochs
-    beta = min(0.5, ep / 20.0)
+    # Beta (KL): Ramp up to 0.5/2 over 20 epochs
+    beta = min(0.5/2, ep / 20.0)
 
     # Alpha (Physics): Ramp up to 10.0 over 30 epochs
     # This lets the model learn "How to draw an airfoil" first (0-10 epochs),
     # and then learns "What the variables mean" (10-30 epochs).
-    alpha_phys = min(10.0, ep / 3.0)
+    if ep < 10:
+        alpha_phys = 0.0# Epoch 0-10: Weight = 0.0 (Focus on geometry)
+    else:
+        alpha_phys = min(10.0, (ep - 10) / 5.0)  # Fast ramp after delay
 
     loss = mse_x + 10.0 * mse_cp + beta * kl_div + alpha_phys * (kl_phys_t + kl_phys_c) + 100.0 * reg_smooth
 
