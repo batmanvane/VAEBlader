@@ -16,7 +16,7 @@ from scipy.interpolate import interp1d
 # 1. CONFIGURATION
 # ============================================================================
 BATCH_SIZE = 64
-EPOCHS = 100
+EPOCHS = 50
 LR = 1e-3
 CLIP_GRAD = 1.0
 LR_PATIENCE = 8
@@ -350,71 +350,99 @@ class RealAirfoilDataset(Dataset):
 # ============================================================================
 # 5. LOSS FUNCTION
 # ============================================================================
+def kl_gauss_to_gauss(mu_q, log_var_q, mu_p, log_var_p):
+    """
+    Calculates KL Divergence between two Gaussians:
+    Q ~ N(mu_q, exp(log_var_q))  (Encoder Distribution)
+    P ~ N(mu_p, exp(log_var_p))  (Target Physical Prior)
+    """
+    var_q = torch.exp(log_var_q)
+    var_p = torch.exp(log_var_p)
+
+    return 0.5 * torch.sum(
+        log_var_p - log_var_q
+        + (var_q + (mu_q - mu_p) ** 2) / var_p
+        - 1.0
+    )
+
+
 def loss_function(rec_x, true_x, rec_cp, true_cp, mt, lt, mc, lc, feat, p_lv, ep, model):
-    # 1. Reconstruction (Weighted Kulfan Tolerance)
+    # --- 1. Reconstruction (Split & Rebalanced) ---
     weights = torch.ones_like(true_x)
-    weights[:, :, :40] = 20.0  # High priority on LE
-    mse_x = torch.sum(weights * (rec_x - true_x) ** 2)
+    weights[:, :, :40] = 20.0  # LE Bias
+    diff = weights * (rec_x - true_x) ** 2
+
+    # Camber Scaling Fix (20x boost)
+    mse_x = torch.sum(diff[:, 0, :]) + 20.0 * torch.sum(diff[:, 1, :])
 
     # 2. Control Point Guidance
     mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')
 
-    # 3. Physics Loss (Latent Consistency)
+    # --- 3. EMBEDDING STRATEGY (The Fix) ---
+    # Instead of standard KL(N(0,1)), we align the Physical Latents with the Physics Labels.
+    # q(z|x) ~ N(mt, lt)
+    # p(z)   ~ N(feat, p_lv)  <-- The Prior is centered on the Physics Label
+
+    # Thickness Latents (First 3 are Physical)
+    kl_t_phys = kl_gauss_to_gauss(
+        mu_q=mt[:, :3], log_var_q=lt[:, :3],
+        mu_p=feat[:, :3], log_var_p=p_lv
+    )
+    # Thickness Free (Rest are Standard Normal)
+    kl_t_free = -0.5 * torch.sum(1 + lt[:, 3:] - mt[:, 3:].pow(2) - lt[:, 3:].exp())
+
+    # Camber Latents (First 3 are Physical)
+    kl_c_phys = kl_gauss_to_gauss(
+        mu_q=mc[:, :3], log_var_q=lc[:, :3],
+        mu_p=feat[:, 3:], log_var_p=p_lv
+    )
+    # Camber Free
+    kl_c_free = -0.5 * torch.sum(1 + lc[:, 3:] - mc[:, 3:].pow(2) - lc[:, 3:].exp())
+
+    # Total KL (Embedding + Regularization)
+    kl_total = kl_t_phys + kl_t_free + kl_c_phys + kl_c_free
+
+    # --- 4. LATENT CONSISTENCY (Decoder Check) ---
+    # We still need to ensure the DECODER respects these latents.
+    # We measure the physics of the GENERATED shape and compare to the LATENT MEAN.
     p_t_rec, p_c_rec = model.calculate_physics(rec_x[:, 0], rec_x[:, 1])
-    kl_phys_t = 0.5 * torch.sum((mt[:, :3] - feat[:, :3]) ** 2)
-    kl_phys_c = 0.5 * torch.sum((mc[:, :3] - feat[:, 3:]) ** 2)
 
-    # 4. KL Divergence (Latent Regularization)
-    kl_div = 0.0
-    for m, l in [(mt, lt), (mc, lc)]:
-        kl_div += -0.5 * torch.sum(1 + l - m.pow(2) - l.exp())
+    loss_consist_t = torch.sum((mt[:, :3] - p_t_rec) ** 2)
+    loss_consist_c = torch.sum((mc[:, :3] - p_c_rec) ** 2)
 
-    # 5. "Body-Only" Smoothness
-    # We ignore the first 3 indices (Nose region) to allow high curvature there.
-    # We only penalize "wiggles" in the main body and trailing edge.
-    # indices: [start_index:] -> [3:] means we skip P0, P1, P2
-
-    # Thickness Smoothness
+    # 5. Smoothness (Body Only)
     cp_t_body = rec_cp[:, 0, 3:]
     diff_t = cp_t_body[:, 2:] - 2 * cp_t_body[:, 1:-1] + cp_t_body[:, :-2]
 
-    # Camber Smoothness
     cp_c_body = rec_cp[:, 1, 3:]
     diff_c = cp_c_body[:, 2:] - 2 * cp_c_body[:, 1:-1] + cp_c_body[:, :-2]
 
     reg_smooth = torch.sum(diff_t ** 2) + torch.sum(diff_c ** 2)
 
-    # --- ANNEALING SCHEDULES ---
-    # Beta (KL): Ramp up to 0.5/2 over 20 epochs
-    beta = min(0.5/2, ep / 20.0)
-
-    # Alpha (Physics): Ramp up to 10.0 over 30 epochs
-    # This lets the model learn "How to draw an airfoil" first (0-10 epochs),
-    # and then learns "What the variables mean" (10-30 epochs).
+    # --- WEIGHTING & ANNEALING ---
+    # We ramp up the Consistency check to force the decoder to learn the mapping
     if ep < 10:
-        alpha_phys = 0.0# Epoch 0-10: Weight = 0.0 (Focus on geometry)
+        alpha_phys = 0.0
     else:
-        alpha_phys = min(10.0, (ep - 10) / 5.0)  # Fast ramp after delay
+        alpha_phys = min(10.0, (ep - 10) / 5.0)
 
-    loss = mse_x + 10.0 * mse_cp + beta * kl_div + alpha_phys * (kl_phys_t + kl_phys_c) + 100.0 * reg_smooth
+    # Beta (KL) is always active to guide the embedding
+    beta = 1.0
+
+    loss = (mse_x +
+            10.0 * mse_cp +
+            beta * kl_total +
+            alpha_phys * (loss_consist_t + loss_consist_c) +
+            100.0 * reg_smooth)
 
     return {
         "loss": loss,
         "rec": mse_x.item(),
         "cp": mse_cp.item(),
-        "kl": kl_div.item(),
-        "phys": (kl_phys_t + kl_phys_c).item(),
+        "kl": kl_total.item(),
+        "phys": (loss_consist_t + loss_consist_c).item(),  # Logging consistency error
         "smooth": reg_smooth.item()
     }
-    return {
-        "loss": loss,
-        "rec": mse_x.item(),
-        "cp": mse_cp.item(),
-        "kl": kl_div.item(),
-        "phys": (kl_phys_t + kl_phys_c).item(),
-        "smooth": reg_smooth.item()
-    }
-
 
 # ============================================================================
 # 6. VISUALIZATION UTILS
@@ -457,9 +485,16 @@ def plot_correlation_matrix(model, dataloader, device):
         for j in range(Y.shape[1]):
             corr[i, j] = np.corrcoef(Z[:, i], Y[:, j])[0, 1]
 
+    # Labels
+    ytick = ([f'T_Phys_{i}' for i in range(LATENT_PHYS_THICK)] +
+                 [f'T_Free_{i}' for i in range(LATENT_FREE_THICK)] +
+                 [f'C_Phys_{i}' for i in range(LATENT_PHYS_CAMBER)] +
+                 [f'C_Free_{i}' for i in range(LATENT_FREE_CAMBER)])
+
+
     labels_phys = ['Max_T', 'Pos_T', 'Rad', 'Max_C', 'Pos_C', 'TE_Dir']
     plt.figure(figsize=(10, 8))
-    sns.heatmap(np.abs(corr), annot=True, fmt=".2f", cmap='viridis', xticklabels=labels_phys)
+    sns.heatmap(np.abs(corr), annot=True, fmt=".2f", cmap='viridis', xticklabels=labels_phys, yticklabels=ytick)
     plt.title("Latent-Physics Correlation")
     plt.savefig('./results/plots/correlation.png')
     plt.close()
@@ -599,7 +634,7 @@ def main():
         # Avg Logs
         n = len(train_dl)
         print(f"Ep {ep:03d} | Loss: {ep_logs['loss'] / n:.1f} | Rec: {ep_logs['rec'] / n:.1f} | "
-              f"Phys: {ep_logs['phys'] / n:.1f} | Smooth: {ep_logs['smooth'] / n:.1f}")
+              f"KL: {ep_logs['kl'] / n:.1f} | Phys: {ep_logs['phys'] / n:.1f} | Smooth: {ep_logs['smooth'] / n:.1f}")
 
         scheduler.step(ep_logs['loss'] / n)
 
