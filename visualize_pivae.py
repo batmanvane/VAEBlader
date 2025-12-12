@@ -88,7 +88,10 @@ def plot_alignment_dashboard(model, z_val, y_val):
 
         for j, val in enumerate(traversal_vals):
             zt, zc = z_base_t.clone(), z_base_c.clone()
-
+            # DEBUG: Print physics of generated shape
+            if i == 3:  # Max Camber Row
+                measured_c = np.max(np.abs(c_out.cpu().numpy()[0]))
+                print(f"Latent: {val:.2f} -> Generated Max Camber: {measured_c:.4f}")
             # Modify the specific latent variable
             if i < 3:
                 zt[0, i] = val  # Thickness Vars

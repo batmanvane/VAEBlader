@@ -19,8 +19,12 @@ from createPIVAE_refactor_LE_and_Input import AG_VAE, BSplineTransform, SEQ_LEN,
 # 1. CONFIGURATION
 # ============================================================================
 VAE_MODEL_PATH = './results/model/ag_vae_cps.pth'
-AIRFOIL_DIR = '../VAEBladerData/data/airfoil/naca_gen'
-POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/naca_gen'
+#AIRFOIL_DIR = '../VAEBladerData/data/airfoil/naca_gen'
+#POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/naca_gen'
+
+AIRFOIL_DIR = '../VAEBladerData/data/airfoil/interpolated_uiuc'
+POLAR_ROOT_DIR = '../VAEBladerData/aerodynamic_label/interpolated_uiuc'
+
 
 BATCH_SIZE = 64
 LR = 1e-3

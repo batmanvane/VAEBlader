@@ -12,10 +12,12 @@ import os
 import glob
 from scipy.interpolate import interp1d
 
+#from torch.utils.data import ConcatDataset # for 2...n datasets
+
 # ============================================================================
 # 1. CONFIGURATION
 # ============================================================================
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 EPOCHS = 50
 LR = 1e-3
 CLIP_GRAD = 1.0
@@ -36,7 +38,9 @@ SEQ_LEN = 200  # Evaluation resolution
 DEC_LAYERS = 3
 DEC_NODES = 128
 
-DATA_DIR = '../VAEBladerData/data/airfoil/naca_gen'
+#DATA_DIR1 = '../VAEBladerData/data/airfoil/naca_gen'
+DATA_DIR = '../VAEBladerData/data/airfoil/interpolated_uiuc'
+
 MAX_FILES = None
 
 
@@ -244,22 +248,30 @@ class AG_VAE(nn.Module):
         return torch.stack([t_out, c_out], 1), torch.stack([cp_t, cp_c], 1), (mu_t, lv_t), (mu_c, lv_c)
 
     def calculate_physics(self, t_dist, c_dist):
-        """ Helper to extract physics from GENERATED curves for Physics Loss """
-        # Max Thickness & Pos
-        max_t, idx_t = torch.max(t_dist, dim=1)
-        pos_max_t = self.bspline.u[idx_t]
+        # Grid for soft argmax
+        x_grid = self.bspline.u.to(t_dist.device)
 
-        # Radius Approx (using point near LE)
-        # r ~ y^2 / 2x
+        # --- 1. Max Thickness ---
+        max_t, _ = torch.max(t_dist, dim=1)  # Value is diff.
+
+        # FIX: Use Soft Argmax for Position so gradients flow
+        pos_max_t = soft_argmax(t_dist, x_grid)
+
+        # --- 2. Radius (Approximation) ---
         x_le = self.bspline.u[2]
         y_le = t_dist[:, 2]
         r_le = (y_le ** 2) / (8 * x_le + 1e-6)
 
-        # Max Camber & Pos
-        max_c, idx_c = torch.max(torch.abs(c_dist), dim=1)
-        pos_max_c = self.bspline.u[idx_c]
+        # --- 3. Max Camber ---
+        # Note: Camber can be negative, so we look at absolute magnitude for "Max"
+        # but we want to preserve the sign if needed. Usually Max Camber is positive.
+        c_abs = torch.abs(c_dist)
+        max_c, _ = torch.max(c_abs, dim=1)
 
-        # TE Direction (Slope at trailing edge)
+        # FIX: Use Soft Argmax for Position
+        pos_max_c = soft_argmax(c_abs, x_grid)
+
+        # --- 4. TE Direction ---
         te_dir = c_dist[:, -1] - c_dist[:, -2]
 
         return torch.stack([max_t, pos_max_t, r_le], 1), torch.stack([max_c, pos_max_c, te_dir], 1)
@@ -366,82 +378,99 @@ def kl_gauss_to_gauss(mu_q, log_var_q, mu_p, log_var_p):
     )
 
 
+def soft_argmax(values, x_grid, beta=500.0):
+    """
+    Differentiable approximation of argmax.
+    Returns the x-coordinate of the maximum value.
+    """
+    # 1. Apply Softmax to get probabilities (weights)
+    # beta controls sharpness. Higher = closer to true argmax.
+    weights = F.softmax(values * beta, dim=1)
+
+    # 2. Compute expected value (weighted average of x coordinates)
+    # x_grid must be broadcasted to [Batch, Seq]
+    if x_grid.dim() == 1:
+        x_grid = x_grid.unsqueeze(0).to(values.device)
+
+    return torch.sum(weights * x_grid, dim=1)
+
+
 def loss_function(rec_x, true_x, rec_cp, true_cp, mt, lt, mc, lc, feat, p_lv, ep, model):
-    # --- 1. Reconstruction (Split & Rebalanced) ---
+    # --- 1. RECONSTRUCTION ---
     weights = torch.ones_like(true_x)
     weights[:, :, :40] = 20.0  # LE Bias
     diff = weights * (rec_x - true_x) ** 2
 
-    # Camber Scaling Fix (20x boost)
-    mse_x = torch.sum(diff[:, 0, :]) + 20.0 * torch.sum(diff[:, 1, :])
+    # Split & Rebalance: Camber * 20.0
+    mse_thick = torch.sum(diff[:, 0, :])
+    mse_camber = torch.sum(diff[:, 1, :])
+    mse_x = mse_thick + 20.0 * mse_camber
 
-    # 2. Control Point Guidance
-    mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')
+    # --- 2. PHYSICS EMBEDDING (KL with Prior p_lv) ---
+    # Your correct implementation: Align Q(z) with P(z|Label, p_lv)
+    kl_t_phys = kl_gauss_to_gauss(mt[:, :3], lt[:, :3], feat[:, :3], p_lv)
+    kl_c_phys = kl_gauss_to_gauss(mc[:, :3], lc[:, :3], feat[:, 3:], p_lv)
 
-    # --- 3. EMBEDDING STRATEGY (The Fix) ---
-    # Instead of standard KL(N(0,1)), we align the Physical Latents with the Physics Labels.
-    # q(z|x) ~ N(mt, lt)
-    # p(z)   ~ N(feat, p_lv)  <-- The Prior is centered on the Physics Label
-
-    # Thickness Latents (First 3 are Physical)
-    kl_t_phys = kl_gauss_to_gauss(
-        mu_q=mt[:, :3], log_var_q=lt[:, :3],
-        mu_p=feat[:, :3], log_var_p=p_lv
-    )
-    # Thickness Free (Rest are Standard Normal)
+    # Free vars: Align with N(0, 1)
     kl_t_free = -0.5 * torch.sum(1 + lt[:, 3:] - mt[:, 3:].pow(2) - lt[:, 3:].exp())
-
-    # Camber Latents (First 3 are Physical)
-    kl_c_phys = kl_gauss_to_gauss(
-        mu_q=mc[:, :3], log_var_q=lc[:, :3],
-        mu_p=feat[:, 3:], log_var_p=p_lv
-    )
-    # Camber Free
     kl_c_free = -0.5 * torch.sum(1 + lc[:, 3:] - mc[:, 3:].pow(2) - lc[:, 3:].exp())
 
-    # Total KL (Embedding + Regularization)
     kl_total = kl_t_phys + kl_t_free + kl_c_phys + kl_c_free
 
-    # --- 4. LATENT CONSISTENCY (Decoder Check) ---
-    # We still need to ensure the DECODER respects these latents.
-    # We measure the physics of the GENERATED shape and compare to the LATENT MEAN.
+    # --- 3. LATENT CONSISTENCY ---
+    # Decoder moves to Encoder (.detach)
     p_t_rec, p_c_rec = model.calculate_physics(rec_x[:, 0], rec_x[:, 1])
+    # Apply .detach to stop gradients flowing into rec_x
+    loss_consist_t = torch.sum((mt[:, :3].detach() - p_t_rec) ** 2)
+    loss_consist_c = torch.sum((mc[:, :3].detach() - p_c_rec) ** 2)
+    loss_phys_total = loss_consist_t + loss_consist_c
 
-    loss_consist_t = torch.sum((mt[:, :3] - p_t_rec) ** 2)
-    loss_consist_c = torch.sum((mc[:, :3] - p_c_rec) ** 2)
+    # --- 4. REGULARIZATION ---
+    mse_cp = F.mse_loss(rec_cp, true_cp, reduction='sum')
 
-    # 5. Smoothness (Body Only)
     cp_t_body = rec_cp[:, 0, 3:]
     diff_t = cp_t_body[:, 2:] - 2 * cp_t_body[:, 1:-1] + cp_t_body[:, :-2]
-
     cp_c_body = rec_cp[:, 1, 3:]
     diff_c = cp_c_body[:, 2:] - 2 * cp_c_body[:, 1:-1] + cp_c_body[:, :-2]
-
     reg_smooth = torch.sum(diff_t ** 2) + torch.sum(diff_c ** 2)
 
-    # --- WEIGHTING & ANNEALING ---
-    # We ramp up the Consistency check to force the decoder to learn the mapping
-    if ep < 10:
+    # --- 5. NORMALIZATION & SCHEDULING ---
+    # Normalizers bring all terms to approx Magnitude ~15-20
+    norm_rec = 1.0  # Base (~20)
+    norm_cp = 10.0  # (~2 -> 20)
+    norm_kl = 0.1  # (~150 -> 15)
+    norm_phys = 0.1  # (~350 -> 17.5)
+    norm_smooth = 100.0  # (~0.1 -> 10)
+
+    # Beta Cycle: 0->1 every 20 epochs
+    cycle_len = 20
+    cycle_progress = (ep % cycle_len) / cycle_len
+    beta = min(1.0, cycle_progress * 2.0)
+
+    # Alpha Ramp: Delayed start
+    if ep < 15:
         alpha_phys = 0.0
     else:
-        alpha_phys = min(10.0, (ep - 10) / 5.0)
+        alpha_phys = min(1.0, (ep - 15) / 25.0)
 
-    # Beta (KL) is always active to guide the embedding
-    beta = 1.0
-
-    loss = (mse_x +
-            10.0 * mse_cp +
-            beta * kl_total +
-            alpha_phys * (loss_consist_t + loss_consist_c) +
-            100.0 * reg_smooth)
+    # Total Loss (Balanced)
+    loss = (
+            norm_rec * mse_x +
+            norm_cp * mse_cp +
+            beta * (norm_kl * kl_total) +
+            alpha_phys * (norm_phys * loss_phys_total) +
+            norm_smooth * reg_smooth
+    )
 
     return {
         "loss": loss,
-        "rec": mse_x.item(),
-        "cp": mse_cp.item(),
-        "kl": kl_total.item(),
-        "phys": (loss_consist_t + loss_consist_c).item(),  # Logging consistency error
-        "smooth": reg_smooth.item()
+        "rec": (norm_rec * mse_x).item(),
+        "cp": (norm_cp * mse_cp).item(),
+        "kl": (norm_kl * kl_total).item(),
+        "phys": (norm_phys * loss_phys_total).item(),
+        "smooth": (norm_smooth * reg_smooth).item(),
+        "beta": beta,
+        "alpha": alpha_phys
     }
 
 # ============================================================================
@@ -598,7 +627,16 @@ def main():
     if not os.path.exists('./results/model'): os.makedirs('./results/model')
 
     # 1. Load Data
+    #load data from DATA_DIR and DATA_DIR1
+    print("Loading datasets...")
+#    ds0 = RealAirfoilDataset(DATA_DIR, num_cp=NUM_CP, seq_len=SEQ_LEN, max_files=MAX_FILES)
+#    ds1 = RealAirfoilDataset(DATA_DIR1, num_cp=NUM_CP, seq_len=SEQ_LEN, max_files=MAX_FILES)
+#    #combine datasets
+#    ds = ConcatDataset([ds0, ds1])
+#    print(f"Combined Dataset Size: {len(ds)}")
+
     ds = RealAirfoilDataset(DATA_DIR, num_cp=NUM_CP, seq_len=SEQ_LEN, max_files=MAX_FILES)
+
     train_sz = int(0.9 * len(ds))
     train_ds, val_ds = random_split(ds, [train_sz, len(ds) - train_sz])
 
@@ -616,7 +654,10 @@ def main():
     print("Starting Training...")
     for ep in range(EPOCHS):
         model.train()
-        ep_logs = {"loss": 0, "rec": 0, "cp": 0, "kl": 0, "phys": 0, "smooth": 0}
+        ep_logs = {
+            "loss": 0, "rec": 0, "cp": 0, "kl": 0, "phys": 0, "smooth": 0,
+            "beta": 0, "alpha": 0
+        }
 
         for cp, f, x in train_dl:
             cp, f, x = cp.to(DEVICE), f.to(DEVICE), x.to(DEVICE)
@@ -634,8 +675,8 @@ def main():
         # Avg Logs
         n = len(train_dl)
         print(f"Ep {ep:03d} | Loss: {ep_logs['loss'] / n:.1f} | Rec: {ep_logs['rec'] / n:.1f} | "
-              f"KL: {ep_logs['kl'] / n:.1f} | Phys: {ep_logs['phys'] / n:.1f} | Smooth: {ep_logs['smooth'] / n:.1f}")
-
+              f"KL: {ep_logs['kl'] / n:.1f} | Phys: {ep_logs['phys'] / n:.1f} | "
+              f"B: {ep_logs['beta'] / n:.2f} | A: {ep_logs['alpha'] / n:.2f}")
         scheduler.step(ep_logs['loss'] / n)
 
     # 3. Finalize
