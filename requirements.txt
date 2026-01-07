@@ -1,0 +1,9 @@
+torch
+numpy
+pandas
+scipy
+plotly
+gradio
+matplotlib
+seaborn
+huggingface_hub

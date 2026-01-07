@@ -1,0 +1,43 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Methodology Overview}{1}{section.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Overview of the PIVAE approach. Raw data is converted to control points using a clustered topology, encoded into a disentangled latent space, and reconstructed via a physics-constrained decoder.}}{1}{figure.1}\protected@file@percent }
+\newlabel{fig:overview}{{1}{1}{Overview of the PIVAE approach. Raw data is converted to control points using a clustered topology, encoded into a disentangled latent space, and reconstructed via a physics-constrained decoder}{figure.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces The "Bridge" Strategy. The latent space is anchored from two sides: (1) The Encoder is forced to place latents at the correct physical label coordinates via KL divergence. (2) The Decoder is forced to respect these latents via a Consistency Loss that measures the generated geometry.}}{2}{figure.2}\protected@file@percent }
+\newlabel{fig:bridge}{{2}{2}{The "Bridge" Strategy. The latent space is anchored from two sides: (1) The Encoder is forced to place latents at the correct physical label coordinates via KL divergence. (2) The Decoder is forced to respect these latents via a Consistency Loss that measures the generated geometry}{figure.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Geometric Parameterization}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Decomposition and B-Spline Representation}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Clustered Knot Vector Topology}{2}{subsection.3.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Clustered Control Point Parameterization. Points $P_1$ and $P_2$ are packed near the leading edge to control the nose radius. The loss function treats these zones differently to avoid conflicting objectives.}}{3}{figure.3}\protected@file@percent }
+\newlabel{fig:cp_placement}{{3}{3}{Clustered Control Point Parameterization. Points $P_1$ and $P_2$ are packed near the leading edge to control the nose radius. The loss function treats these zones differently to avoid conflicting objectives}{figure.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Preprocessing: Constrained Fitting}{3}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Decoder Process Scheme}{3}{section.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Decoder Scheme with Region-Specific Constraints. A higher bias is applied to the nose control points ($P_1, P_2$) to prevent the leading edge from collapsing into a sharp wedge.}}{4}{figure.4}\protected@file@percent }
+\newlabel{fig:decoder}{{4}{4}{Decoder Scheme with Region-Specific Constraints. A higher bias is applied to the nose control points ($P_1, P_2$) to prevent the leading edge from collapsing into a sharp wedge}{figure.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Physics Alignment and Training Strategy}{4}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Embedding Strategy}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.1.1}Physics-Informed Prior (Encoder Side)}{5}{subsubsection.5.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.1.2}Latent Consistency with Gradient Stop (Decoder Side)}{5}{subsubsection.5.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Loss Function and Training}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.2.1}Split \& Rebalanced Reconstruction ($\mathcal  {L}_{rec}$)}{5}{subsubsection.5.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.2.2}Physics Embedding via KL Divergence ($\mathcal  {L}_{kl}$)}{5}{subsubsection.5.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.2.3}Latent Consistency with Gradient Stop ($\mathcal  {L}_{consist}$)}{6}{subsubsection.5.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.2.4}Body-Only Smoothness ($\mathcal  {L}_{reg}$)}{6}{subsubsection.5.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {5.2.5}Scheduling Strategy}{6}{subsubsection.5.2.5}\protected@file@percent }
